@@ -6,7 +6,11 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
 
 
 LOG = logging.getLogger("csv_cleaner")
@@ -21,6 +25,8 @@ class Config:
     output_path: Path
     drop_duplicates: bool
     verbose: bool
+    random_seed: int = 42
+    test_size: float = 0.2
 
 
 def configure_logging(verbose: bool) -> None:
@@ -46,6 +52,15 @@ def parse_args(argv: list[str]) -> Config:
         help="Drop duplicate rows",
     )
     p.add_argument("--verbose", action="store_true", help="Enable debug logs")
+    p.add_argument(
+        "--seed", type=int, default=42, help="Random seed for train/test split (default: 42)"
+    )
+    p.add_argument(
+        "--test-size",
+        type=float,
+        default=0.2,
+        help="Fraction of data for test set (default: 0.2)",
+    )
 
     args = p.parse_args(argv)
     configure_logging(args.verbose)
@@ -55,6 +70,8 @@ def parse_args(argv: list[str]) -> Config:
         output_path=Path(args.output),
         drop_duplicates=bool(args.drop_duplicates),
         verbose=bool(args.verbose),
+        random_seed=args.seed,
+        test_size=args.test_size,
     )
 
 
@@ -104,15 +121,29 @@ def clean_data(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     if after != before:
         LOG.warning("Dropped %d rows due to invalid numeric values", before - after)
 
-    # Basic sanity checks
-    if (df["SizeSqFt"] <= 0).any():
-        raise ValueError("Invalid data: SizeSqFt must be > 0")
-    if (df["Bedrooms"] <= 0).any():
-        raise ValueError("Invalid data: Bedrooms must be > 0")
-    if (df["AgeYears"] < 0).any():
-        raise ValueError("Invalid data: AgeYears must be >= 0")
-    if (df["Price"] <= 0).any():
-        raise ValueError("Invalid data: Price must be > 0")
+    # Filter rows that violate constraints (instead of raising)
+    bad_size = df["SizeSqFt"] <= 0
+    if bad_size.any():
+        LOG.warning("Filtered %d rows with SizeSqFt <= 0", bad_size.sum())
+        df = df[~bad_size]
+
+    bad_bed = df["Bedrooms"] <= 0
+    if bad_bed.any():
+        LOG.warning("Filtered %d rows with Bedrooms <= 0", bad_bed.sum())
+        df = df[~bad_bed]
+
+    bad_age = df["AgeYears"] < 0
+    if bad_age.any():
+        LOG.warning("Filtered %d rows with AgeYears < 0", bad_age.sum())
+        df = df[~bad_age]
+
+    bad_price = df["Price"] <= 0
+    if bad_price.any():
+        LOG.warning("Filtered %d rows with Price <= 0", bad_price.sum())
+        df = df[~bad_price]
+
+    if df.empty:
+        raise ValueError("No valid rows remain after cleaning")
 
     if cfg.drop_duplicates:
         before = len(df)
@@ -131,6 +162,44 @@ def write_cleaned_csv(df: pd.DataFrame, cfg: Config) -> None:
     LOG.info("Wrote cleaned CSV: %s", cfg.output_path)
 
 
+def split_data(
+    df: pd.DataFrame, cfg: Config
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    train_df, test_df = train_test_split(
+        df, test_size=cfg.test_size, random_state=cfg.random_seed
+    )
+    stem = cfg.output_path.stem
+    parent = cfg.output_path.parent
+
+    train_path = parent / f"{stem}_train.csv"
+    test_path = parent / f"{stem}_test.csv"
+
+    train_df.to_csv(train_path, index=False)
+    test_df.to_csv(test_path, index=False)
+
+    LOG.info(
+        "Split: train=%d rows (%s), test=%d rows (%s)",
+        len(train_df), train_path, len(test_df), test_path,
+    )
+    return train_df, test_df
+
+
+def evaluate_model(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
+    features = ["SizeSqFt", "Bedrooms", "AgeYears"]
+    target = "Price"
+
+    model = LinearRegression()
+    model.fit(train_df[features], train_df[target])
+
+    predictions = model.predict(test_df[features])
+    r2 = r2_score(test_df[target], predictions)
+    mae = mean_absolute_error(test_df[target], predictions)
+    rmse = np.sqrt(mean_squared_error(test_df[target], predictions))
+
+    LOG.info("Model metrics — R²: %.4f, MAE: %.2f, RMSE: %.2f", r2, mae, rmse)
+    return {"r2": r2, "mae": mae, "rmse": rmse}
+
+
 def main(argv: list[str]) -> int:
     try:
         cfg = parse_args(argv)
@@ -141,6 +210,9 @@ def main(argv: list[str]) -> int:
 
         cleaned = clean_data(df, cfg)
         write_cleaned_csv(cleaned, cfg)
+
+        train_df, test_df = split_data(cleaned, cfg)
+        evaluate_model(train_df, test_df)
 
         LOG.info("Done. Clean rows=%d", len(cleaned))
         return 0
