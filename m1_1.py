@@ -63,7 +63,12 @@ def validate_input_file(cfg: Config) -> None:
         raise FileNotFoundError(f"Input file not found: {cfg.input_path}")
 
     if cfg.input_path.suffix.lower() != ".csv":
-        raise ValueError("Only .csv files are supported.")
+        raise ValueError(
+            f"Only .csv files are supported, got '{cfg.input_path.suffix}'"
+        )
+
+    if cfg.input_path.stat().st_size == 0:
+        raise ValueError(f"Input file is empty: {cfg.input_path}")
 
 
 def load_csv(cfg: Config) -> pd.DataFrame:
@@ -113,6 +118,9 @@ def clean_data(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         before = len(df)
         df = df.drop_duplicates()
         LOG.info("Dropped %d duplicate rows", before - len(df))
+
+    # Sort for deterministic output
+    df = df.sort_values(EXPECTED_COLUMNS).reset_index(drop=True)
 
     return df
 
